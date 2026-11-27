@@ -17,7 +17,7 @@ public sealed class PedigreeMod : MewgenicsMod
 {
     public override string Id => "pedigree";
     public override string Name => "Pedigree";
-    public override string Version => "0.1.6";
+    public override string Version => "0.1.7";
     public override string Description =>
         "Room plan, run squad, recruits and donations. Moves cats only when you press a button.";
     public override string Category => "Quality of Life";
@@ -40,6 +40,9 @@ public sealed class PedigreeMod : MewgenicsMod
     int _frame;
     /// <summary>Where each moved cat slept before the first arrange of the day: Undo puts them all back.</summary>
     readonly Dictionary<long, string> _dayStart = new();
+    /// <summary>Cats sent to the box, waiting for the delayed check: id -> (name, room they came from).</summary>
+    readonly Dictionary<long, (string name, string? from)> _pendingStage = new();
+    int _houseFrame, _stageCheckFrame;
 
     long _lastBackupDay = -1;
 
@@ -87,7 +90,7 @@ public sealed class PedigreeMod : MewgenicsMod
 
     // ---------------------------------------------------------------- events
 
-    void OnDayAdvanced(DayAdvancedEvent e) { _morningDue = true; _refreshStatus = true; _dayStart.Clear(); }
+    void OnDayAdvanced(DayAdvancedEvent e) { _morningDue = true; _refreshStatus = true; _dayStart.Clear(); _pendingStage.Clear(); }
     void OnAdventureReturn(AdventureReturnEvent e) { _refreshStatus = true; }
 
     void OnKeyDown(KeyEventArgs e)
@@ -104,6 +107,8 @@ public sealed class PedigreeMod : MewgenicsMod
     /// <summary>Every frame on the house screen: cheap unless a refresh or the morning summary is due.</summary>
     void OnHouseUpdate(HouseUpdateEvent e)
     {
+        _houseFrame++;
+        if (_pendingStage.Count > 0 && _houseFrame >= _stageCheckFrame) CheckStaged();
         if (!_refreshStatus && !_morningDue) return;
         if (++_frame % 30 != 0) return;               // about twice a second
         if (GameFlow.InterstitialCount > 0) return;   // wait for the morning screens to close
@@ -187,35 +192,58 @@ public sealed class PedigreeMod : MewgenicsMod
     });
 
     /// <summary>
-    /// Moves the suggested squad into the adventure box container. Each cat is checked afterwards: if it is not in the
-    /// box, it goes straight back to its room, so no cat is left misplaced.
+    /// Moves the suggested squad into the adventure box container. The game may apply a move on a later frame, so each
+    /// cat is checked about a second later (see <see cref="CheckStaged"/>): any cat not in the box by then goes back
+    /// to its room, so no cat is left misplaced.
     /// </summary>
     void StageSquad() => Safe("stage squad", () =>
     {
         if (Mew.IsInCombat) { Status("Not during a fight."); return; }
+        if (_pendingStage.Count > 0) { CheckStaged(); return; }   // a second press finishes the last check now
         var (plan, snap) = Compute();
         if (snap.Rooms.Count == 0) { Status("Open the house screen first."); return; }
         var todo = plan.Squad.Where(x => !x.Cat.InAdventureBox).Select(x => x.Cat).ToList();
         if (todo.Count == 0) { Status(plan.Squad.Count > 0 ? "Squad already in the box." : "Nobody can go on a run."); return; }
 
-        int placed = 0; var failed = new List<string>();
+        LogContainers("before staging");
         foreach (var cat in todo)
         {
-            if (!snap.Chars.TryGetValue(cat.Id, out var ch) || !ch.IsLiveAndValid) { failed.Add(cat.Name); continue; }
-            string? from = cat.Room;
-            ch.MoveToRoomCenter(GameSnapshot.BoxContainer);
+            if (!snap.Chars.TryGetValue(cat.Id, out var ch) || !ch.IsLiveAndValid) continue;
+            bool accepted = ch.MoveToRoomCenter(GameSnapshot.BoxContainer);
             string? now = GameBreeding.RoomOf(ch)?.Name;
-            if (now == GameSnapshot.BoxContainer) { placed++; Log($"[Pedigree] box: {cat.Name} {from ?? "outside"}->{now}"); }
-            else
-            {
-                failed.Add(cat.Name);
-                Log($"[Pedigree] box: {cat.Name} ended in {now ?? "(none)"}, not the box; moving it back to {from ?? "(none)"}");
-                if (from != null && now != from && snap.Rooms.Any(r => r.Name == from)) ch.MoveToRoomCenter(from);
-            }
+            Log($"[Pedigree] box: {cat.Name} from {cat.Room ?? "outside"}: move returned {accepted}, room right after = {now ?? "(none)"}");
+            _pendingStage[cat.Id] = (cat.Name, cat.Room);
         }
-        _refreshStatus = true;
-        Status($"Box: {placed} in." + (failed.Count > 0 ? $" {failed.Count} failed, left in rooms (see log)." : ""));
+        _stageCheckFrame = _houseFrame + 60;   // about a second at 60 fps
+        Status("Moving squad to the box...");
     });
+
+    /// <summary>Second half of staging, about a second later: keeps cats that reached the box, puts the rest back.</summary>
+    void CheckStaged() => Safe("check staging", () =>
+    {
+        var world = GameWorld.Current;
+        int placed = 0, failed = 0;
+        foreach (var (id, (name, from)) in _pendingStage)
+        {
+            var ch = world.GetCatById(id);
+            if (!ch.HasValue || !ch.Value.IsLiveAndValid) { failed++; continue; }
+            string? now = GameBreeding.RoomOf(ch.Value)?.Name;
+            if (now == GameSnapshot.BoxContainer) { placed++; Log($"[Pedigree] box: {name} is in the box"); continue; }
+            failed++;
+            Log($"[Pedigree] box: {name} is in {now ?? "(none)"} a second later, not the box; moving it back to {from ?? "(none)"}");
+            if (from != null && now != from) ch.Value.MoveToRoomCenter(from);
+        }
+        _pendingStage.Clear();
+        LogContainers("after staging");
+        _refreshStatus = true;
+        Status($"Box: {placed} in." + (failed > 0 ? $" {failed} failed, left in rooms (see log)." : ""));
+    });
+
+    void LogContainers(string when)
+    {
+        try { Log($"[Pedigree] containers {when}: " + string.Join(", ", GameBreeding.GetRooms().Select(r => $"{r.Name}={r.CatCount}"))); }
+        catch (Exception ex) { Log($"[Pedigree] containers {when} failed: {ex.Message}"); }
+    }
 
     void Undo() => Safe("undo", () =>
     {
