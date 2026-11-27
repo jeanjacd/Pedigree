@@ -59,8 +59,8 @@ Everything lives in the mod menu (**F10**):
 |---|---|
 | **Show plan** (or **F9**) | The full plan with reasons: layout, pairs, squad, notable offspring, recruits, retirements. |
 | **Auto-arrange** | Applies the layout. Backs up the save first, once per in-game day. |
-| **Stage squad** | Places the suggested squad in the expedition staging area. |
-| **Undo last arrange** | Reverts the most recent auto-arrange. |
+| **Stage squad** | Places the suggested squad in the expedition staging area, verifies each placement, and rolls back any that miss. |
+| **Undo today's arranging** | Restores the layout from before the day's first auto-arrange, however many arranges followed. |
 | Morning summary | After each day, a short note only when there is something to decide. |
 | Risk ceiling | Highest birth-defect risk allowed in a pair. |
 

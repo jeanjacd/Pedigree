@@ -115,7 +115,7 @@ public sealed class PairScorer
             if (hi >= 7) q += 0.75;
             if (hi >= _houseBest[i]) q += 0.35;
         }
-        if (Breeding.AreLovers(a, b)) q += 0.8;
+        if (Breeding.AreLovers(a, b)) q += 1.5;   // bonded cats pair up far more reliably
         if (a.Aggression >= 0.7 && b.Aggression >= 0.7) q -= 1.5;
         return q;
     }

@@ -154,7 +154,7 @@
    "RivalId": 166,
    "IsKitten": false,
    "IsOld": false,
-   "IsRetired": false,
+   "IsRetired": true,
    "Room": "Floor1_Small",
    "Level": 1,
    "ClassName": "",

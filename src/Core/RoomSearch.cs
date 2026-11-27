@@ -19,7 +19,7 @@ internal sealed class RoomSearch
 
     // weights
     const double CrowdPerCat = 8, RivalPenalty = 300, UnsafeBase = 200, UnsafePerRisk = 400;
-    const double FightersTogether = 4, FighterLowComfort = 2, MoveCost = 0.4, LoversApart = 1.5, Dilution = 0.3;
+    const double FightersTogether = 4, FighterLowComfort = 2, MoveCost = 0.4, LoversApart = 6, Dilution = 0.3;
 
     readonly List<(int, int)> _lovers = new();
 

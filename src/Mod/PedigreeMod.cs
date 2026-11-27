@@ -17,7 +17,7 @@ public sealed class PedigreeMod : MewgenicsMod
 {
     public override string Id => "pedigree";
     public override string Name => "Pedigree";
-    public override string Version => "0.1.1";
+    public override string Version => "0.1.5";
     public override string Description =>
         "Breeding and roster advice. Suggests where every cat should sleep (one click to arrange), the next run squad, " +
         "which strays to take in and which cats to donate. Moves cats only when you press a button; never donates anything.";
@@ -39,15 +39,23 @@ public sealed class PedigreeMod : MewgenicsMod
     bool _refreshStatus = true;
     bool _morningDue;
     int _frame;
-    List<(long id, string room)> _undoMoves = new();
+    /// <summary>Where each moved cat slept before the first arrange of the day: Undo puts them all back.</summary>
+    readonly Dictionary<long, string> _dayStart = new();
+    /// <summary>Cats this mod put in the adventure box (the SDK cannot tell on this build).</summary>
+    readonly HashSet<long> _staged = new();
+
+    // The adventure box: four slots outdoors, right of the house, read from saves where cats sat in it
+    // (house_state: no container, x = 38..41, y = 0).
+    static readonly double[] BoxSlotsX = { 38, 39, 40, 41 };
+    const double BoxY = 0;
     long _lastBackupDay = -1;
 
     public PedigreeMod()
     {
         _show = new ButtonSetting("show_plan", "Show plan", ShowPlan);
         _arrange = new ButtonSetting("arrange", "Auto-arrange rooms", Arrange);
-        _stage = new ButtonSetting("stage_squad", "Put run squad in the adventure box", StageSquad);
-        _undo = new ButtonSetting("undo", "Undo last arrange", Undo);
+        _stage = new ButtonSetting("stage_box", "Put run squad in the adventure box", StageSquad);
+        _undo = new ButtonSetting("undo", "Undo today's arranging", Undo);
     }
 
     protected override void OnEnable()
@@ -67,6 +75,7 @@ public sealed class PedigreeMod : MewgenicsMod
             GameEvents.OnKeyDown += OnKeyDown;
             _subscribed = true;
         }
+        TidyMenu();
         _refreshStatus = true;
         Status("Ready. Open the house and press Show plan or Auto-arrange rooms.");
     }
@@ -85,8 +94,8 @@ public sealed class PedigreeMod : MewgenicsMod
 
     // ---------------------------------------------------------------- events
 
-    void OnDayAdvanced(DayAdvancedEvent e) { _morningDue = true; _refreshStatus = true; _undoMoves.Clear(); }
-    void OnAdventureReturn(AdventureReturnEvent e) { _refreshStatus = true; }
+    void OnDayAdvanced(DayAdvancedEvent e) { _morningDue = true; _refreshStatus = true; _dayStart.Clear(); _staged.Clear(); }
+    void OnAdventureReturn(AdventureReturnEvent e) { _refreshStatus = true; _staged.Clear(); }
 
     void OnKeyDown(KeyEventArgs e)
     {
@@ -128,7 +137,36 @@ public sealed class PedigreeMod : MewgenicsMod
         if (snap.Rooms.Count == 0) { Status("Open the house screen first."); return; }
         Status(Report.Status(plan));
         GameMessages.Show($"Pedigree · Day {snap.Day}", Report.Full(plan));
+        LogHouseLayout(snap);
     });
+
+    /// <summary>
+    /// Diagnostics for the adventure box: logs every container the game reports (not only breeding rooms) and every
+    /// cat's position. Positions are read on a worker thread because the SDK refreshes them only off the game thread.
+    /// </summary>
+    void LogHouseLayout(GameSnapshot snap)
+    {
+        try
+        {
+            foreach (var r in GameBreeding.GetRooms())
+                Log($"[Pedigree] layout: container {r.Name} breeding={r.IsBreedingRoom} cats={r.CatCount}");
+        }
+        catch (Exception ex) { Log($"[Pedigree] layout rooms failed: {ex.Message}"); }
+        var chars = snap.Chars.Values.ToList();
+        var rooms = snap.Cats.ToDictionary(c => c.Id, c => c.Room ?? (c.InAdventureBox ? "(box)" : "(none)"));
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            try
+            {
+                foreach (var ch in chars)
+                {
+                    var (x, y) = ch.Position;
+                    Log($"[Pedigree] layout: cat {ch.Name} room={rooms.GetValueOrDefault(ch.CatId, "?")} pos=({x:0.00}, {y:0.00}) inBox={ch.IsInAdventureBox}");
+                }
+            }
+            catch (Exception ex) { Log($"[Pedigree] layout positions failed: {ex.Message}"); }
+        });
+    }
 
     void Arrange() => Safe("arrange", () =>
     {
@@ -138,59 +176,104 @@ public sealed class PedigreeMod : MewgenicsMod
         if (plan.Moves.Count == 0) { Status("Rooms already match the plan. " + Report.Status(plan)); return; }
 
         string backup = BackupSave(snap.Day);
-        var undo = new List<(long, string)>();
         var failed = new List<string>();
+        var done = new List<string>();
         foreach (var m in plan.Moves)
         {
-            if (!snap.Chars.TryGetValue(m.Cat.Id, out var ch) || !ch.IsLiveAndValid) { failed.Add(m.Cat.Name); continue; }
-            if (ch.MoveToRoomCenter(m.To))
+            bool ok = snap.Chars.TryGetValue(m.Cat.Id, out var ch) && ch.IsLiveAndValid && ch.MoveToRoomCenter(m.To);
+            if (ok)
             {
-                if (m.From != null && snap.Rooms.Any(r => r.Name == m.From)) undo.Add((m.Cat.Id, m.From));
+                // Remember only the first room of the day, so Undo goes back to the morning layout.
+                if (!_dayStart.ContainsKey(m.Cat.Id) && m.From != null && snap.Rooms.Any(r => r.Name == m.From)) _dayStart[m.Cat.Id] = m.From;
+                done.Add($"{m.Cat.Name} {m.From ?? "outside"}->{m.To}");
             }
             else failed.Add(m.Cat.Name);
         }
-        _undoMoves = undo;
-        int moved = plan.Moves.Count - failed.Count;
-        Status($"Moved {moved} cat{(moved == 1 ? "" : "s")}." +
+        Status($"Moved {done.Count} cat{(done.Count == 1 ? "" : "s")}." +
                (failed.Count > 0 ? $" Could not move {string.Join(", ", failed)}." : "") +
                (backup.Length > 0 ? " Save backed up." : ""));
-        Log($"[Pedigree] arranged: {string.Join(", ", plan.Moves.Select(x => $"{x.Cat.Name}->{x.To}"))}");
+        Log($"[Pedigree] arranged: {(done.Count > 0 ? string.Join(", ", done) : "nothing")}" + (failed.Count > 0 ? $"; FAILED: {string.Join(", ", failed)}" : ""));
     });
 
+    /// <summary>
+    /// Puts the suggested squad in the adventure box slots. Each cat is checked afterwards: if it did not end up
+    /// outdoors (in the box), it goes straight back to its room and is reported, so no cat is left misplaced.
+    /// </summary>
     void StageSquad() => Safe("stage squad", () =>
     {
+        if (Mew.IsInCombat) { Status("Not during a fight."); return; }
         var (plan, snap) = Compute();
         if (snap.Rooms.Count == 0) { Status("Open the house screen first."); return; }
-        var todo = plan.Squad.Where(s => !s.Cat.InAdventureBox).ToList();
+        var todo = plan.Squad.Where(x => !x.Cat.InAdventureBox).Select(x => x.Cat).ToList();
+        int slot = plan.Squad.Count - todo.Count;
         if (todo.Count == 0) { Status(plan.Squad.Count > 0 ? "The squad is already in the box." : "Nobody can go on a run right now."); return; }
+
         var placed = new List<string>(); var failed = new List<string>();
-        foreach (var s in todo)
-            if (snap.Chars.TryGetValue(s.Cat.Id, out var ch) && ch.MoveToAdventureBox()) placed.Add(s.Cat.Name);
-            else failed.Add(s.Cat.Name);
+        foreach (var cat in todo)
+        {
+            if (slot >= BoxSlotsX.Length) break;
+            if (!snap.Chars.TryGetValue(cat.Id, out var ch) || !ch.IsLiveAndValid) { failed.Add(cat.Name); continue; }
+            string? from = cat.Room;
+            var target = (BoxSlotsX[slot], BoxY);
+            ch.Position = target;   // the SDK teleport: moves the cat and transfers it to the container at that spot
+            string? now = GameBreeding.RoomOf(ch)?.Name;
+            if (now == null)
+            {
+                _staged.Add(cat.Id); placed.Add(cat.Name);
+                Log($"[Pedigree] box: {cat.Name} -> slot {slot + 1} (x={BoxSlotsX[slot]})");
+                slot++;
+            }
+            else
+            {
+                failed.Add(cat.Name);
+                Log($"[Pedigree] box: {cat.Name} landed in {now}, not the box; moving it back to {from ?? "(none)"}");
+                if (from != null && snap.Rooms.Any(r => r.Name == from)) ch.MoveToRoomCenter(from);
+            }
+        }
+        _refreshStatus = true;
         Status((placed.Count > 0 ? $"In the box: {string.Join(", ", placed)}." : "") +
-               (failed.Count > 0 ? $" No room in the box for {string.Join(", ", failed)}." : ""));
+               (failed.Count > 0 ? $" Could not place {string.Join(", ", failed)}; they stayed in their rooms." : ""));
     });
 
     void Undo() => Safe("undo", () =>
     {
-        if (_undoMoves.Count == 0) { Status("Nothing to undo."); return; }
+        if (_dayStart.Count == 0) { Status("Nothing to undo today."); return; }
         var world = GameWorld.Current;
-        int back = 0;
-        foreach (var (id, room) in _undoMoves)
+        var back = new List<string>(); var failed = new List<string>();
+        foreach (var (id, room) in _dayStart)
         {
             var ch = world.GetCatById(id);
-            if (ch.HasValue && ch.Value.IsLiveAndValid && ch.Value.MoveToRoomCenter(room)) back++;
+            if (!ch.HasValue || !ch.Value.IsLiveAndValid) continue;
+            if (GameBreeding.RoomOf(ch.Value)?.Name == room) continue;   // already where it started
+            if (ch.Value.MoveToRoomCenter(room)) back.Add($"{ch.Value.Name}->{room}"); else failed.Add(ch.Value.Name);
         }
-        _undoMoves = new();
+        _dayStart.Clear();
         _refreshStatus = true;
-        Status($"Put {back} cat{(back == 1 ? "" : "s")} back.");
+        Status($"Put {back.Count} cat{(back.Count == 1 ? "" : "s")} back where they started today." + (failed.Count > 0 ? $" Could not move {string.Join(", ", failed)}." : ""));
+        Log($"[Pedigree] undo: {(back.Count > 0 ? string.Join(", ", back) : "nothing")}" + (failed.Count > 0 ? $"; FAILED: {string.Join(", ", failed)}" : ""));
     });
 
     // ---------------------------------------------------------------- helpers
 
+    /// <summary>Removes menu entries of older versions and refreshes the button labels in Mods\config\pedigree.cfg.</summary>
+    void TidyMenu()
+    {
+        try
+        {
+            if (Config == null) return;
+            foreach (var key in new[] { "stage_squad", "stage_squad__hint", "stage_squad__action" }) Config.Remove(key);
+            foreach (var b in new[] { _show, _arrange, _stage, _undo })
+            {
+                Config.SetHint(b.Key, b.Label);
+                Config.SetAction(b.Key, b.Label);
+            }
+        }
+        catch (Exception ex) { Log($"[Pedigree] menu tidy failed: {ex.Message}"); }
+    }
+
     (Plan plan, GameSnapshot snap) Compute()
     {
-        var snap = GameSnapshot.Take(Log);
+        var snap = GameSnapshot.Take(Log, _staged);
         var settings = new PlannerSettings { MaxDefectRisk = Math.Clamp(_maxRisk.Value, 2, 40) / 100.0 };
         var plan = new Planner(snap.Cats, snap.Rooms, snap, settings).Build(snap.Day);
         return (plan, snap);

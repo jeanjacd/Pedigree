@@ -32,6 +32,7 @@ public sealed class Planner
         foreach (var c in _cats) plan.CatNames[c.Id] = c.Name;
         if (_rooms.Count == 0) { plan.Notes.Add("Open the house screen to get a plan."); return plan; }
 
+        MarkStagedCats();
         CurrentAlerts(plan);
         EvaluateStrays(plan);
 
@@ -71,6 +72,19 @@ public sealed class Planner
     }
 
     bool InRoom(CatInfo c) => c.Room != null && _rooms.Any(r => r.Name == c.Room);
+
+    /// <summary>
+    /// A cat outdoors (no room at all, not the pipe) is either a stray at the door, a cat back from a run waiting in
+    /// the adventure box (retired: bring it inside), or a cat the player put in the box for the next run. The last
+    /// kind is a fresh adult with family or bonds in the house; it is left where it is and counted in the squad.
+    /// </summary>
+    void MarkStagedCats()
+    {
+        var home = _cats.Where(c => c.IsHome && InRoom(c)).ToList();
+        foreach (var c in _cats)
+            if (c.Room == null && !c.IsAway && !c.InAdventureBox && !c.IsRetired && !c.IsKitten && !IsStray(c, home))
+                c.InAdventureBox = true;
+    }
 
     /// <summary>
     /// A stray is a cat outside the breeding rooms that the player has not decided on yet: a fresh adult with no
