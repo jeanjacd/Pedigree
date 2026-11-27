@@ -1,9 +1,6 @@
 # Pedigree
 
-Pedigree is an in-game planning engine for a tactical roguelike built around a persistent, breeding roster.
-Between runs, units that share a room can pair overnight, and their offspring inherit each of seven stats from one
-parent or the other. Pedigree reads the live game state, solves the nightly room-assignment problem, picks the next
-expedition squad and flags recruits and retirements, then applies the layout in one click from the game's mod menu.
+Pedigree is an in-game planning engine for a tactical roguelike with a persistent, evolving roster. Between runs, the arrangement of units across the base determines how the roster's stats develop over generations. Pedigree reads the live game state, solves that arrangement as an optimization problem, picks the next expedition squad and flags which units to recruit or retire, then applies the plan in one click from the game's mod menu
 
 ## The problem
 
