@@ -17,7 +17,7 @@ public sealed class PedigreeMod : MewgenicsMod
 {
     public override string Id => "pedigree";
     public override string Name => "Pedigree";
-    public override string Version => "0.1.0";
+    public override string Version => "0.1.1";
     public override string Description =>
         "Breeding and roster advice. Suggests where every cat should sleep (one click to arrange), the next run squad, " +
         "which strays to take in and which cats to donate. Moves cats only when you press a button; never donates anything.";
@@ -190,7 +190,7 @@ public sealed class PedigreeMod : MewgenicsMod
 
     (Plan plan, GameSnapshot snap) Compute()
     {
-        var snap = GameSnapshot.Take();
+        var snap = GameSnapshot.Take(Log);
         var settings = new PlannerSettings { MaxDefectRisk = Math.Clamp(_maxRisk.Value, 2, 40) / 100.0 };
         var plan = new Planner(snap.Cats, snap.Rooms, snap, settings).Build(snap.Day);
         return (plan, snap);

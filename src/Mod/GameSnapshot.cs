@@ -21,22 +21,34 @@ internal sealed class GameSnapshot : IGenetics
     readonly Dictionary<(long, long), double> _kin = new();
     readonly Dictionary<(long, long), double> _att = new();
 
-    public static GameSnapshot Take()
+    public static GameSnapshot Take(Action<string>? log = null)
     {
         var s = new GameSnapshot();
         if (!Mew.IsReady) return s;
         s.Day = Mew.Day;
 
-        foreach (var r in GameBreeding.GetRooms())
+        var roomInfos = GameBreeding.GetRooms();
+        foreach (var r in roomInfos)
             if (r.IsBreedingRoom)
                 s.Rooms.Add(new RoomState { Name = r.Name, Stimulation = r.Stimulation, ComfortBase = r.Comfort });
         if (s.Rooms.Count == 0) return s;   // not on the house screen
 
         var world = GameWorld.Current;
         if (!world.IsValid) return s;
-        foreach (var c in world.GetPlayerCats())
+
+        // The cats of the house. GetPlayerCats() is not used: its "player" flag marks fighting-team cats, so house
+        // cats are missing from it. The raw cat database is not used either: it also keeps donated and dead cats.
+        // Two sources, merged by id: Mew.Cats (alive and in the house) and the cats each room reports standing in it.
+        var all = new Dictionary<long, GameChar>();
+        int fromMew = 0, fromRooms = 0;
+        foreach (var c in Mew.Cats) if (c.IsLiveAndValid && all.TryAdd(c.CatId, c)) fromMew++;
+        foreach (var r in roomInfos)
+            foreach (var id in r.CatIds)
+                if (!all.ContainsKey(id) && world.GetCatById(id) is GameChar rc && rc.IsLiveAndValid) { all[id] = rc; fromRooms++; }
+        log?.Invoke($"[Pedigree] snapshot: {s.Rooms.Count} rooms, {all.Count} cats (house list {fromMew}, room lists +{fromRooms})");
+
+        foreach (var c in all.Values)
         {
-            if (!c.IsLiveAndValid) continue;
             string? room = GameBreeding.RoomOf(c)?.Name;
             bool inBox = c.IsInAdventureBox;
             var info = new CatInfo
