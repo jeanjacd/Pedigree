@@ -17,7 +17,7 @@ public sealed class PedigreeMod : MewgenicsMod
 {
     public override string Id => "pedigree";
     public override string Name => "Pedigree";
-    public override string Version => "0.1.8";
+    public override string Version => "0.1.9";
     public override string Description =>
         "Room plan, run squad, recruits and donations. Moves cats only when you press a button.";
     public override string Category => "Quality of Life";
@@ -45,6 +45,8 @@ public sealed class PedigreeMod : MewgenicsMod
     /// <summary>A world position known to be inside the adventure box (learned, then saved in box.txt).</summary>
     (double x, double y)? _boxSpot;
     int _houseFrame;
+    volatile bool _planning;
+    int _gameThreadId;
 
     sealed class StageJob
     {
@@ -121,34 +123,88 @@ public sealed class PedigreeMod : MewgenicsMod
     /// <summary>Every frame on the house screen: cheap unless a refresh or the morning summary is due.</summary>
     void OnHouseUpdate(HouseUpdateEvent e)
     {
+        _gameThreadId = Environment.CurrentManagedThreadId;
         _houseFrame++;
         var job = _job;
-        if (job != null) { if (_houseFrame >= job.CheckAt) StepStage(job); }
-        else if (_houseFrame % 300 == 0) LearnBoxSpot();
+        if (job != null) { if (_houseFrame >= job.CheckAt) Timed("squad step", () => StepStage(job)); }
+        else if (_houseFrame % 300 == 0) Timed("box scan", LearnBoxSpot);
         if (!_refreshStatus && !_morningDue) return;
         if (++_frame % 30 != 0) return;               // about twice a second
-        if (GameFlow.InterstitialCount > 0) return;   // wait for the morning screens to close
-        Safe("refresh", () =>
+        if (_planning || GameFlow.InterstitialCount > 0) return;   // wait for the morning screens to close
+        _refreshStatus = false;
+        Planned("refresh", (plan, snap) =>
         {
-            var (plan, snap) = Compute();
-            if (snap.Rooms.Count == 0) return;        // house not on screen yet
             Status(Report.Status(plan));
-            _refreshStatus = false;
             if (_morningDue)
             {
                 _morningDue = false;
                 var text = Report.Morning(plan);
                 if (_morning.Value && text.Length > 0) GameMessages.Show($"Pedigree · Day {snap.Day}", text);
             }
+        }, onNoHouse: () => _refreshStatus = true);   // house not on screen yet: try again later
+    }
+
+    /// <summary>
+    /// Reads the house on the game thread, plans on a worker thread (the search takes up to a few hundred ms, which
+    /// would stall the game for that long), then runs <paramref name="then"/> back on the game thread.
+    /// </summary>
+    void Planned(string what, Action<Plan, GameSnapshot> then, Action? onNoHouse = null)
+    {
+        if (!_supported) return;
+        if (_planning) { Status("Working..."); return; }
+        if (_gameThreadId != 0 && Environment.CurrentManagedThreadId != _gameThreadId)
+        {
+            GameThread.Enqueue(() => Planned(what, then, onNoHouse));
+            return;
+        }
+        _planning = true;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        GameSnapshot snap;
+        try { snap = GameSnapshot.Take(Log); }
+        catch (Exception ex) { _planning = false; Fail(what, ex); return; }
+        long readMs = sw.ElapsedMilliseconds;
+        if (snap.Rooms.Count == 0)
+        {
+            _planning = false;
+            if (onNoHouse != null) onNoHouse(); else Status("Open the house screen first.");
+            return;
+        }
+        var settings = new PlannerSettings { MaxDefectRisk = Math.Clamp(_maxRisk.Value, 2, 40) / 100.0 };
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            var planSw = System.Diagnostics.Stopwatch.StartNew();
+            Plan plan;
+            try { plan = new Planner(snap.Cats, snap.Rooms, snap, settings).Build(snap.Day); }
+            catch (Exception ex) { _planning = false; GameThread.Enqueue(() => Fail(what, ex)); return; }
+            Log($"[Pedigree] timing {what}: read {readMs} ms on game thread, plan {planSw.ElapsedMilliseconds} ms on worker");
+            GameThread.Enqueue(() =>
+            {
+                _planning = false;
+                Timed(what, () => Safe(what, () => then(plan, snap)));
+            });
         });
+    }
+
+    /// <summary>Runs game-thread work and logs it if it took long enough to show as a hitch.</summary>
+    void Timed(string what, Action action)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        action();
+        if (sw.ElapsedMilliseconds >= 20) Log($"[Pedigree] timing {what}: {sw.ElapsedMilliseconds} ms on game thread");
+    }
+
+    void Fail(string what, Exception ex)
+    {
+        _refreshStatus = false;
+        _morningDue = false;
+        Status($"Error in {what}; nothing changed. See mods_debug.log.");
+        Log($"[Pedigree] {what} failed: {ex}");
     }
 
     // ---------------------------------------------------------------- buttons
 
-    void ShowPlan() => Safe("show plan", () =>
+    void ShowPlan() => Planned("show plan", (plan, snap) =>
     {
-        var (plan, snap) = Compute();
-        if (snap.Rooms.Count == 0) { Status("Open the house screen first."); return; }
         Status(Report.Status(plan));
         GameMessages.Show($"Pedigree · Day {snap.Day}", Report.Full(plan));
         LogHouseLayout(snap);
@@ -182,11 +238,15 @@ public sealed class PedigreeMod : MewgenicsMod
         });
     }
 
-    void Arrange() => Safe("arrange", () =>
+    void Arrange()
     {
         if (Mew.IsInCombat) { Status("Not during a fight."); return; }
-        var (plan, snap) = Compute();
-        if (snap.Rooms.Count == 0) { Status("Open the house screen first."); return; }
+        if (_job != null) { Status("Still moving the squad..."); return; }
+        Planned("arrange", ArrangeWith);
+    }
+
+    void ArrangeWith(Plan plan, GameSnapshot snap)
+    {
         if (plan.Moves.Count == 0) { Status("Rooms already match the plan."); return; }
 
         string backup = BackupSave(snap.Day);
@@ -205,7 +265,7 @@ public sealed class PedigreeMod : MewgenicsMod
         }
         Status($"Moved {done.Count}." + (failed.Count > 0 ? $" {failed.Count} failed (see log)." : "") + (backup.Length > 0 ? " Save backed up." : ""));
         Log($"[Pedigree] arranged: {(done.Count > 0 ? string.Join(", ", done) : "nothing")}" + (failed.Count > 0 ? $"; FAILED: {string.Join(", ", failed)}" : ""));
-    });
+    }
 
     /// <summary>
     /// Moves the suggested squad into the adventure box. The game files a cat under whichever container its new
@@ -213,12 +273,15 @@ public sealed class PedigreeMod : MewgenicsMod
     /// list of likely spots right of the house) and checked a few frames later. Once one cat lands in the box, the rest
     /// follow to the same spot. Any cat that doesn't land goes back to the room it came from.
     /// </summary>
-    void StageSquad() => Safe("stage squad", () =>
+    void StageSquad()
     {
         if (Mew.IsInCombat) { Status("Not during a fight."); return; }
         if (_job != null) { Status("Still moving the squad..."); return; }
-        var (plan, snap) = Compute();
-        if (snap.Rooms.Count == 0) { Status("Open the house screen first."); return; }
+        Planned("stage squad", StageWith);
+    }
+
+    void StageWith(Plan plan, GameSnapshot snap)
+    {
         var todo = plan.Squad.Where(x => !x.Cat.InAdventureBox).Select(x => x.Cat).ToList();
         if (todo.Count == 0) { Status(plan.Squad.Count > 0 ? "Squad already in the box." : "Nobody can go on a run."); return; }
 
@@ -241,7 +304,7 @@ public sealed class PedigreeMod : MewgenicsMod
         job.CheckAt = _houseFrame + 20;
         _job = job;
         Status(_boxSpot != null ? "Moving squad to the box..." : "Finding the adventure box...");
-    });
+    }
 
     /// <summary>One step of the squad move, on the game thread once the last move has had time to settle.</summary>
     void StepStage(StageJob job) => Safe("stage squad", () =>
@@ -317,11 +380,7 @@ public sealed class PedigreeMod : MewgenicsMod
         cat.Position = spot;   // GameChar is a handle: the setter teleports the cat by id
     }
 
-    static bool InBox(long id)
-    {
-        var ch = GameWorld.Current.GetCatById(id);
-        return ch.HasValue && ch.Value.IsLiveAndValid && GameBreeding.RoomOf(ch.Value)?.Name == GameSnapshot.BoxContainer;
-    }
+    static bool InBox(long id) => GameBreeding.GetRoom(GameSnapshot.BoxContainer)?.CatIds.Contains(id) == true;
 
     static void PutBack(long id, string? room)
     {
@@ -338,10 +397,9 @@ public sealed class PedigreeMod : MewgenicsMod
     {
         try
         {
-            GameChar? boxed = null;
-            foreach (var c in Mew.Cats)
-                if (c.IsLiveAndValid && GameBreeding.RoomOf(c)?.Name == GameSnapshot.BoxContainer) { boxed = c; break; }
-            if (boxed is not { } cat) return;
+            var box = GameBreeding.GetRoom(GameSnapshot.BoxContainer);
+            if (box == null || box.CatCount == 0) return;
+            if (GameWorld.Current.GetCatById(box.CatIds.First()) is not { IsLiveAndValid: true } cat) return;
             System.Threading.Tasks.Task.Run(() =>
             {
                 try
@@ -423,14 +481,6 @@ public sealed class PedigreeMod : MewgenicsMod
             foreach (Setting st in new Setting[] { _morning, _hotkey, _maxRisk }) Config.SetHint(st.Key, st.Label);
         }
         catch (Exception ex) { Log($"[Pedigree] menu tidy failed: {ex.Message}"); }
-    }
-
-    (Plan plan, GameSnapshot snap) Compute()
-    {
-        var snap = GameSnapshot.Take(Log);
-        var settings = new PlannerSettings { MaxDefectRisk = Math.Clamp(_maxRisk.Value, 2, 40) / 100.0 };
-        var plan = new Planner(snap.Cats, snap.Rooms, snap, settings).Build(snap.Day);
-        return (plan, snap);
     }
 
     /// <summary>Copies the newest save into the mod folder once per game day, before the first arrange. Keeps 10.</summary>

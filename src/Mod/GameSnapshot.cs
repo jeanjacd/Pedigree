@@ -9,7 +9,9 @@ namespace Pedigree;
 /// <summary>
 /// Reads the live house into the planner's game-independent model. This is the only file (with the actions in
 /// PedigreeMod) that touches game memory, so a game update that moves things around only breaks this layer.
-/// Call on the game thread.
+/// Take it on the game thread: every SDK read here is marshalled to that thread, so taking it anywhere else costs a
+/// frame per read. <see cref="Take"/> also reads every pair's kinship and attraction up front, so the planner can then
+/// run on a worker thread without touching the game.
 /// </summary>
 internal sealed class GameSnapshot : IGenetics
 {
@@ -22,6 +24,7 @@ internal sealed class GameSnapshot : IGenetics
 
     readonly Dictionary<(long, long), double> _kin = new();
     readonly Dictionary<(long, long), double> _att = new();
+    bool _frozen;   // after Take: a pair that wasn't read up front is treated as unrelated rather than read off-thread
 
     public static GameSnapshot Take(Action<string>? log = null)
     {
@@ -49,9 +52,15 @@ internal sealed class GameSnapshot : IGenetics
                 if (!all.ContainsKey(id) && world.GetCatById(id) is GameChar rc && rc.IsLiveAndValid) { all[id] = rc; fromRooms++; }
         log?.Invoke($"[Pedigree] snapshot: {s.Rooms.Count} rooms, {all.Count} cats (house list {fromMew}, room lists +{fromRooms})");
 
+        // Which container each cat is in, from the one room read above. (GameBreeding.RoomOf reads every room again
+        // per cat.)
+        var roomOf = new Dictionary<long, string>();
+        foreach (var r in roomInfos)
+            foreach (var id in r.CatIds) roomOf.TryAdd(id, r.Name);
+
         foreach (var c in all.Values)
         {
-            string? room = GameBreeding.RoomOf(c)?.Name;
+            string? room = roomOf.GetValueOrDefault(c.CatId);
             // The box is a container of its own, "AdventureBox". (GameChar.IsInAdventureBox is not used: it checks a
             // spot inside 1st Floor Right and flags cats standing there.) A retired cat in the box just came back
             // from a run and still needs a room; any other cat in it was put there for the next run.
@@ -84,6 +93,14 @@ internal sealed class GameSnapshot : IGenetics
             s.Cats.Add(info);
             s.Chars[info.Id] = c;
         }
+
+        for (int i = 0; i < s.Cats.Count; i++)
+            for (int j = i + 1; j < s.Cats.Count; j++)
+            {
+                s.Kinship(s.Cats[i], s.Cats[j]);
+                s.Attraction(s.Cats[i], s.Cats[j]);
+            }
+        s._frozen = true;
         return s;
     }
 
@@ -92,7 +109,7 @@ internal sealed class GameSnapshot : IGenetics
     public double Kinship(CatInfo a, CatInfo b)
     {
         var k = Key(a, b);
-        if (_kin.TryGetValue(k, out var v)) return v;
+        if (_kin.TryGetValue(k, out var v) || _frozen) return v;
         v = Chars.TryGetValue(a.Id, out var ca) && Chars.TryGetValue(b.Id, out var cb) ? GameBreeding.Kinship(ca, cb) : 0;
         if (double.IsNaN(v)) v = 0;
         _kin[k] = v;
@@ -102,7 +119,7 @@ internal sealed class GameSnapshot : IGenetics
     public double Attraction(CatInfo a, CatInfo b)
     {
         var k = Key(a, b);
-        if (_att.TryGetValue(k, out var v)) return v;
+        if (_att.TryGetValue(k, out var v) || _frozen) return v;
         v = 0;
         if (Chars.TryGetValue(a.Id, out var ca) && Chars.TryGetValue(b.Id, out var cb))
             v = Math.Max(GameBreeding.PairingChance(ca, cb), GameBreeding.PairingChance(cb, ca));
