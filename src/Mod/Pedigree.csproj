@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Pedigree: a mod for the game's community mod framework. Build the game DLL on Windows with build.ps1 (NativeAOT). -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <AssemblyName>Pedigree</AssemblyName>
+    <RootNamespace>Pedigree</RootNamespace>
+    <Nullable>enable</Nullable>
+    <LangVersion>12</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <!-- NativeAOT is switched on by build.ps1 (-p:PublishAot=true); a plain `dotnet build` only type-checks. -->
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="MewgenicsModSdk">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\sdk\MewgenicsModSdk.dll</HintPath>
+    </Reference>
+    <Compile Include="..\Core\*.cs" Link="Core\%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>
