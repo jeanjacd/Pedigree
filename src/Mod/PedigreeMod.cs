@@ -17,10 +17,9 @@ public sealed class PedigreeMod : MewgenicsMod
 {
     public override string Id => "pedigree";
     public override string Name => "Pedigree";
-    public override string Version => "0.1.5";
+    public override string Version => "0.1.6";
     public override string Description =>
-        "Breeding and roster advice. Suggests where every cat should sleep (one click to arrange), the next run squad, " +
-        "which strays to take in and which cats to donate. Moves cats only when you press a button; never donates anything.";
+        "Room plan, run squad, recruits and donations. Moves cats only when you press a button.";
     public override string Category => "Quality of Life";
     public override bool AutoEnable => true;
 
@@ -29,10 +28,10 @@ public sealed class PedigreeMod : MewgenicsMod
     readonly ButtonSetting _arrange;
     readonly ButtonSetting _stage;
     readonly ButtonSetting _undo;
-    readonly BoolSetting _morning = new("morning_popup", "Morning summary popup (new kittens, strays, problems)", true);
-    readonly ChoiceSetting _hotkey = new("hotkey", "Hotkey for the full plan", "F9",
+    readonly BoolSetting _morning = new("morning_popup", "Morning summary popup", true);
+    readonly ChoiceSetting _hotkey = new("hotkey", "Plan hotkey", "F9",
         new[] { ("none", "None"), ("F6", "F6"), ("F7", "F7"), ("F8", "F8"), ("F9", "F9"), ("F11", "F11") });
-    readonly IntSetting _maxRisk = new("max_risk", "Highest birth-defect risk allowed in a pair (%)", 5, 2, 40);
+    readonly IntSetting _maxRisk = new("max_risk", "Max pair defect risk %", 5, 2, 40);
 
     bool _supported;
     bool _subscribed;
@@ -41,21 +40,15 @@ public sealed class PedigreeMod : MewgenicsMod
     int _frame;
     /// <summary>Where each moved cat slept before the first arrange of the day: Undo puts them all back.</summary>
     readonly Dictionary<long, string> _dayStart = new();
-    /// <summary>Cats this mod put in the adventure box (the SDK cannot tell on this build).</summary>
-    readonly HashSet<long> _staged = new();
 
-    // The adventure box: four slots outdoors, right of the house, read from saves where cats sat in it
-    // (house_state: no container, x = 38..41, y = 0).
-    static readonly double[] BoxSlotsX = { 38, 39, 40, 41 };
-    const double BoxY = 0;
     long _lastBackupDay = -1;
 
     public PedigreeMod()
     {
         _show = new ButtonSetting("show_plan", "Show plan", ShowPlan);
         _arrange = new ButtonSetting("arrange", "Auto-arrange rooms", Arrange);
-        _stage = new ButtonSetting("stage_box", "Put run squad in the adventure box", StageSquad);
-        _undo = new ButtonSetting("undo", "Undo today's arranging", Undo);
+        _stage = new ButtonSetting("stage_box", "Squad to adventure box", StageSquad);
+        _undo = new ButtonSetting("undo", "Undo today's moves", Undo);
     }
 
     protected override void OnEnable()
@@ -63,7 +56,7 @@ public sealed class PedigreeMod : MewgenicsMod
         _supported = GameBuild.IsSupported(GameBase);
         if (!_supported)
         {
-            Status($"Off: this game build is not {GameBuild.Supported}, the version the mod framework supports. Your game was not touched.");
+            Status($"Off: needs game build {GameBuild.Supported}.");
             Log($"[Pedigree] unsupported game build (PE timestamp 0x{GameBuild.ReadPeTimestamp(GameBase):X8}); staying idle");
             return;
         }
@@ -77,7 +70,7 @@ public sealed class PedigreeMod : MewgenicsMod
         }
         TidyMenu();
         _refreshStatus = true;
-        Status("Ready. Open the house and press Show plan or Auto-arrange rooms.");
+        Status("Ready.");
     }
 
     protected override void OnDisable()
@@ -94,8 +87,8 @@ public sealed class PedigreeMod : MewgenicsMod
 
     // ---------------------------------------------------------------- events
 
-    void OnDayAdvanced(DayAdvancedEvent e) { _morningDue = true; _refreshStatus = true; _dayStart.Clear(); _staged.Clear(); }
-    void OnAdventureReturn(AdventureReturnEvent e) { _refreshStatus = true; _staged.Clear(); }
+    void OnDayAdvanced(DayAdvancedEvent e) { _morningDue = true; _refreshStatus = true; _dayStart.Clear(); }
+    void OnAdventureReturn(AdventureReturnEvent e) { _refreshStatus = true; }
 
     void OnKeyDown(KeyEventArgs e)
     {
@@ -173,7 +166,7 @@ public sealed class PedigreeMod : MewgenicsMod
         if (Mew.IsInCombat) { Status("Not during a fight."); return; }
         var (plan, snap) = Compute();
         if (snap.Rooms.Count == 0) { Status("Open the house screen first."); return; }
-        if (plan.Moves.Count == 0) { Status("Rooms already match the plan. " + Report.Status(plan)); return; }
+        if (plan.Moves.Count == 0) { Status("Rooms already match the plan."); return; }
 
         string backup = BackupSave(snap.Day);
         var failed = new List<string>();
@@ -189,15 +182,13 @@ public sealed class PedigreeMod : MewgenicsMod
             }
             else failed.Add(m.Cat.Name);
         }
-        Status($"Moved {done.Count} cat{(done.Count == 1 ? "" : "s")}." +
-               (failed.Count > 0 ? $" Could not move {string.Join(", ", failed)}." : "") +
-               (backup.Length > 0 ? " Save backed up." : ""));
+        Status($"Moved {done.Count}." + (failed.Count > 0 ? $" {failed.Count} failed (see log)." : "") + (backup.Length > 0 ? " Save backed up." : ""));
         Log($"[Pedigree] arranged: {(done.Count > 0 ? string.Join(", ", done) : "nothing")}" + (failed.Count > 0 ? $"; FAILED: {string.Join(", ", failed)}" : ""));
     });
 
     /// <summary>
-    /// Puts the suggested squad in the adventure box slots. Each cat is checked afterwards: if it did not end up
-    /// outdoors (in the box), it goes straight back to its room and is reported, so no cat is left misplaced.
+    /// Moves the suggested squad into the adventure box container. Each cat is checked afterwards: if it is not in the
+    /// box, it goes straight back to its room, so no cat is left misplaced.
     /// </summary>
     void StageSquad() => Safe("stage squad", () =>
     {
@@ -205,34 +196,25 @@ public sealed class PedigreeMod : MewgenicsMod
         var (plan, snap) = Compute();
         if (snap.Rooms.Count == 0) { Status("Open the house screen first."); return; }
         var todo = plan.Squad.Where(x => !x.Cat.InAdventureBox).Select(x => x.Cat).ToList();
-        int slot = plan.Squad.Count - todo.Count;
-        if (todo.Count == 0) { Status(plan.Squad.Count > 0 ? "The squad is already in the box." : "Nobody can go on a run right now."); return; }
+        if (todo.Count == 0) { Status(plan.Squad.Count > 0 ? "Squad already in the box." : "Nobody can go on a run."); return; }
 
-        var placed = new List<string>(); var failed = new List<string>();
+        int placed = 0; var failed = new List<string>();
         foreach (var cat in todo)
         {
-            if (slot >= BoxSlotsX.Length) break;
             if (!snap.Chars.TryGetValue(cat.Id, out var ch) || !ch.IsLiveAndValid) { failed.Add(cat.Name); continue; }
             string? from = cat.Room;
-            var target = (BoxSlotsX[slot], BoxY);
-            ch.Position = target;   // the SDK teleport: moves the cat and transfers it to the container at that spot
+            ch.MoveToRoomCenter(GameSnapshot.BoxContainer);
             string? now = GameBreeding.RoomOf(ch)?.Name;
-            if (now == null)
-            {
-                _staged.Add(cat.Id); placed.Add(cat.Name);
-                Log($"[Pedigree] box: {cat.Name} -> slot {slot + 1} (x={BoxSlotsX[slot]})");
-                slot++;
-            }
+            if (now == GameSnapshot.BoxContainer) { placed++; Log($"[Pedigree] box: {cat.Name} {from ?? "outside"}->{now}"); }
             else
             {
                 failed.Add(cat.Name);
-                Log($"[Pedigree] box: {cat.Name} landed in {now}, not the box; moving it back to {from ?? "(none)"}");
-                if (from != null && snap.Rooms.Any(r => r.Name == from)) ch.MoveToRoomCenter(from);
+                Log($"[Pedigree] box: {cat.Name} ended in {now ?? "(none)"}, not the box; moving it back to {from ?? "(none)"}");
+                if (from != null && now != from && snap.Rooms.Any(r => r.Name == from)) ch.MoveToRoomCenter(from);
             }
         }
         _refreshStatus = true;
-        Status((placed.Count > 0 ? $"In the box: {string.Join(", ", placed)}." : "") +
-               (failed.Count > 0 ? $" Could not place {string.Join(", ", failed)}; they stayed in their rooms." : ""));
+        Status($"Box: {placed} in." + (failed.Count > 0 ? $" {failed.Count} failed, left in rooms (see log)." : ""));
     });
 
     void Undo() => Safe("undo", () =>
@@ -249,7 +231,7 @@ public sealed class PedigreeMod : MewgenicsMod
         }
         _dayStart.Clear();
         _refreshStatus = true;
-        Status($"Put {back.Count} cat{(back.Count == 1 ? "" : "s")} back where they started today." + (failed.Count > 0 ? $" Could not move {string.Join(", ", failed)}." : ""));
+        Status($"Undid {back.Count} move{(back.Count == 1 ? "" : "s")}." + (failed.Count > 0 ? $" {failed.Count} failed (see log)." : ""));
         Log($"[Pedigree] undo: {(back.Count > 0 ? string.Join(", ", back) : "nothing")}" + (failed.Count > 0 ? $"; FAILED: {string.Join(", ", failed)}" : ""));
     });
 
@@ -267,13 +249,14 @@ public sealed class PedigreeMod : MewgenicsMod
                 Config.SetHint(b.Key, b.Label);
                 Config.SetAction(b.Key, b.Label);
             }
+            foreach (Setting st in new Setting[] { _morning, _hotkey, _maxRisk }) Config.SetHint(st.Key, st.Label);
         }
         catch (Exception ex) { Log($"[Pedigree] menu tidy failed: {ex.Message}"); }
     }
 
     (Plan plan, GameSnapshot snap) Compute()
     {
-        var snap = GameSnapshot.Take(Log, _staged);
+        var snap = GameSnapshot.Take(Log);
         var settings = new PlannerSettings { MaxDefectRisk = Math.Clamp(_maxRisk.Value, 2, 40) / 100.0 };
         var plan = new Planner(snap.Cats, snap.Rooms, snap, settings).Build(snap.Day);
         return (plan, snap);
@@ -325,7 +308,7 @@ public sealed class PedigreeMod : MewgenicsMod
         {
             _refreshStatus = false;
             _morningDue = false;
-            Status($"Something went wrong during {what}; nothing else was changed. Details in mods_debug.log.");
+            Status($"Error in {what}; nothing changed. See mods_debug.log.");
             Log($"[Pedigree] {what} failed: {ex}");
         }
     }

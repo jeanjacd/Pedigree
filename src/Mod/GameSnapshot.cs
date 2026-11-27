@@ -13,6 +13,8 @@ namespace Pedigree;
 /// </summary>
 internal sealed class GameSnapshot : IGenetics
 {
+    public const string BoxContainer = "AdventureBox";
+
     public readonly List<CatInfo> Cats = new();
     public readonly List<RoomState> Rooms = new();
     public readonly Dictionary<long, GameChar> Chars = new();
@@ -21,7 +23,7 @@ internal sealed class GameSnapshot : IGenetics
     readonly Dictionary<(long, long), double> _kin = new();
     readonly Dictionary<(long, long), double> _att = new();
 
-    public static GameSnapshot Take(Action<string>? log = null, ISet<long>? staged = null)
+    public static GameSnapshot Take(Action<string>? log = null)
     {
         var s = new GameSnapshot();
         if (!Mew.IsReady) return s;
@@ -50,9 +52,10 @@ internal sealed class GameSnapshot : IGenetics
         foreach (var c in all.Values)
         {
             string? room = GameBreeding.RoomOf(c)?.Name;
-            // Not GameChar.IsInAdventureBox: it looks for the box inside 1st Floor Right, where it was in an older
-            // build. Cats the mod put in the box are known here; the planner recognises the others.
-            bool inBox = room == null && staged != null && staged.Contains(c.CatId);
+            // The box is a container of its own, "AdventureBox". (GameChar.IsInAdventureBox is not used: it checks a
+            // spot inside 1st Floor Right and flags cats standing there.) A retired cat in the box just came back
+            // from a run and still needs a room; any other cat in it was put there for the next run.
+            bool inBox = room == BoxContainer && !(c.IsRetired || !c.CanGoOnAdventure);
             var info = new CatInfo
             {
                 Id = c.CatId,

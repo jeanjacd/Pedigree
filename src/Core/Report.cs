@@ -77,10 +77,10 @@ public static class Report
         var parts = new List<string>();
         if (p.Alerts.Count + p.Warnings.Count > 0) parts.Add(Plural(p.Alerts.Count + p.Warnings.Count, "alert"));
         parts.Add(p.Moves.Count == 0 ? "rooms OK" : Plural(p.Moves.Count, "move"));
-        if (p.Squad.Count > 0) parts.Add("squad: " + string.Join(", ", p.Squad.Select(s => s.Cat.Name)));
-        var keep = p.Strays.Where(s => s.Keep).Select(s => s.Cat.Name).ToList();
-        if (keep.Count > 0) parts.Add("take in " + string.Join(", ", keep));
-        if (p.Donations.Count > 0) parts.Add("donate " + string.Join(", ", p.Donations.Select(d => d.Cat.Name)));
+        if (p.Squad.Count > 0) parts.Add($"squad {p.Squad.Count}/4");
+        int keep = p.Strays.Count(s => s.Keep);
+        if (keep > 0) parts.Add($"{keep} to take in");
+        if (p.Donations.Count > 0) parts.Add($"{p.Donations.Count} to donate");
         return string.Join(" · ", parts);
     }
 
