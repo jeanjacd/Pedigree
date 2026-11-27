@@ -17,7 +17,7 @@ public sealed class PedigreeMod : MewgenicsMod
 {
     public override string Id => "pedigree";
     public override string Name => "Pedigree";
-    public override string Version => "0.1.9";
+    public override string Version => "0.1.10";
     public override string Description =>
         "Room plan, run squad, recruits and donations. Moves cats only when you press a button.";
     public override string Category => "Quality of Life";
@@ -174,6 +174,8 @@ public sealed class PedigreeMod : MewgenicsMod
         {
             var planSw = System.Diagnostics.Stopwatch.StartNew();
             Plan plan;
+            try { snap.DropGone(Log); }
+            catch (Exception ex) { Log($"[Pedigree] checking for departed cats failed: {ex.Message}"); }
             try { plan = new Planner(snap.Cats, snap.Rooms, snap, settings).Build(snap.Day); }
             catch (Exception ex) { _planning = false; GameThread.Enqueue(() => Fail(what, ex)); return; }
             Log($"[Pedigree] timing {what}: read {readMs} ms on game thread, plan {planSw.ElapsedMilliseconds} ms on worker");
@@ -455,7 +457,9 @@ public sealed class PedigreeMod : MewgenicsMod
         {
             var ch = world.GetCatById(id);
             if (!ch.HasValue || !ch.Value.IsLiveAndValid) continue;
-            if (GameBreeding.RoomOf(ch.Value)?.Name == room) continue;   // already where it started
+            string? now = GameBreeding.RoomOf(ch.Value)?.Name;
+            if (now == room) continue;   // already where it started
+            if (now == null) { Log($"[Pedigree] undo: skipped {ch.Value.Name}: not in the house any more"); continue; }   // donated, or away
             if (ch.Value.MoveToRoomCenter(room)) back.Add($"{ch.Value.Name}->{room}"); else failed.Add(ch.Value.Name);
         }
         _dayStart.Clear();

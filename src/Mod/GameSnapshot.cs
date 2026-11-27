@@ -104,6 +104,33 @@ internal sealed class GameSnapshot : IGenetics
         return s;
     }
 
+    /// <summary>
+    /// Drops cats that are no longer in the house. A donated cat stays in the game's list of live cats (until the day
+    /// ends, it seems) but is taken out of every container and loses its body, so its position reads as NaN. A stray
+    /// waiting outside has no container either, but it has a position. Call off the game thread: positions are
+    /// refreshed by the game thread on request, and waiting for that on the game thread itself would stall it.
+    /// </summary>
+    public void DropGone(Action<string>? log = null)
+    {
+        var gone = new List<CatInfo>();
+        foreach (var c in Cats)
+        {
+            if (c.Room != null || c.InAdventureBox || c.IsAway) continue;
+            if (!Chars.TryGetValue(c.Id, out var ch)) continue;
+            var (x, y) = ch.Position;
+            if (double.IsNaN(x) || double.IsNaN(y)) gone.Add(c);
+        }
+        foreach (var c in gone)
+        {
+            Cats.Remove(c);
+            Gone.Add(c.Id);
+            log?.Invoke($"[Pedigree] snapshot: {c.Name} has left the house (no room, no position); left out of the plan");
+        }
+    }
+
+    /// <summary>Cats dropped by <see cref="DropGone"/>.</summary>
+    public readonly HashSet<long> Gone = new();
+
     static (long, long) Key(CatInfo a, CatInfo b) => a.Id < b.Id ? (a.Id, b.Id) : (b.Id, a.Id);
 
     public double Kinship(CatInfo a, CatInfo b)
