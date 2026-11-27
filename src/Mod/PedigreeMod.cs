@@ -17,7 +17,7 @@ public sealed class PedigreeMod : MewgenicsMod
 {
     public override string Id => "pedigree";
     public override string Name => "Pedigree";
-    public override string Version => "0.1.7";
+    public override string Version => "0.1.8";
     public override string Description =>
         "Room plan, run squad, recruits and donations. Moves cats only when you press a button.";
     public override string Category => "Quality of Life";
@@ -26,7 +26,7 @@ public sealed class PedigreeMod : MewgenicsMod
     // ---- F10 menu (the SDK registers these fields when the mod loads) ----
     readonly ButtonSetting _show;
     readonly ButtonSetting _arrange;
-    readonly ButtonSetting _stage;
+    readonly ButtonSetting _stageButton;
     readonly ButtonSetting _undo;
     readonly BoolSetting _morning = new("morning_popup", "Morning summary popup", true);
     readonly ChoiceSetting _hotkey = new("hotkey", "Plan hotkey", "F9",
@@ -40,9 +40,23 @@ public sealed class PedigreeMod : MewgenicsMod
     int _frame;
     /// <summary>Where each moved cat slept before the first arrange of the day: Undo puts them all back.</summary>
     readonly Dictionary<long, string> _dayStart = new();
-    /// <summary>Cats sent to the box, waiting for the delayed check: id -> (name, room they came from).</summary>
-    readonly Dictionary<long, (string name, string? from)> _pendingStage = new();
-    int _houseFrame, _stageCheckFrame;
+    /// <summary>The squad move in progress, advanced a step at a time from the house update.</summary>
+    volatile StageJob? _job;
+    /// <summary>A world position known to be inside the adventure box (learned, then saved in box.txt).</summary>
+    (double x, double y)? _boxSpot;
+    int _houseFrame;
+
+    sealed class StageJob
+    {
+        public readonly List<(long id, string name, string? from)> Cats = new();
+        public readonly List<(double x, double y)> Spots = new();   // tried in order with the first cat
+        public int SpotIdx;
+        public bool Found;
+        public bool Retried;
+        public int CheckAt;
+        public int Placed;
+        public readonly List<string> Failed = new();
+    }
 
     long _lastBackupDay = -1;
 
@@ -50,7 +64,7 @@ public sealed class PedigreeMod : MewgenicsMod
     {
         _show = new ButtonSetting("show_plan", "Show plan", ShowPlan);
         _arrange = new ButtonSetting("arrange", "Auto-arrange rooms", Arrange);
-        _stage = new ButtonSetting("stage_box", "Squad to adventure box", StageSquad);
+        _stageButton = new ButtonSetting("stage_box", "Squad to adventure box", StageSquad);
         _undo = new ButtonSetting("undo", "Undo today's moves", Undo);
     }
 
@@ -90,7 +104,7 @@ public sealed class PedigreeMod : MewgenicsMod
 
     // ---------------------------------------------------------------- events
 
-    void OnDayAdvanced(DayAdvancedEvent e) { _morningDue = true; _refreshStatus = true; _dayStart.Clear(); _pendingStage.Clear(); }
+    void OnDayAdvanced(DayAdvancedEvent e) { _morningDue = true; _refreshStatus = true; _dayStart.Clear(); _job = null; }
     void OnAdventureReturn(AdventureReturnEvent e) { _refreshStatus = true; }
 
     void OnKeyDown(KeyEventArgs e)
@@ -108,7 +122,9 @@ public sealed class PedigreeMod : MewgenicsMod
     void OnHouseUpdate(HouseUpdateEvent e)
     {
         _houseFrame++;
-        if (_pendingStage.Count > 0 && _houseFrame >= _stageCheckFrame) CheckStaged();
+        var job = _job;
+        if (job != null) { if (_houseFrame >= job.CheckAt) StepStage(job); }
+        else if (_houseFrame % 300 == 0) LearnBoxSpot();
         if (!_refreshStatus && !_morningDue) return;
         if (++_frame % 30 != 0) return;               // about twice a second
         if (GameFlow.InterstitialCount > 0) return;   // wait for the morning screens to close
@@ -192,52 +208,179 @@ public sealed class PedigreeMod : MewgenicsMod
     });
 
     /// <summary>
-    /// Moves the suggested squad into the adventure box container. The game may apply a move on a later frame, so each
-    /// cat is checked about a second later (see <see cref="CheckStaged"/>): any cat not in the box by then goes back
-    /// to its room, so no cat is left misplaced.
+    /// Moves the suggested squad into the adventure box. The game files a cat under whichever container its new
+    /// position falls in, so the first cat is placed at a known box position (or, until one is known, tried at a short
+    /// list of likely spots right of the house) and checked a few frames later. Once one cat lands in the box, the rest
+    /// follow to the same spot. Any cat that doesn't land goes back to the room it came from.
     /// </summary>
     void StageSquad() => Safe("stage squad", () =>
     {
         if (Mew.IsInCombat) { Status("Not during a fight."); return; }
-        if (_pendingStage.Count > 0) { CheckStaged(); return; }   // a second press finishes the last check now
+        if (_job != null) { Status("Still moving the squad..."); return; }
         var (plan, snap) = Compute();
         if (snap.Rooms.Count == 0) { Status("Open the house screen first."); return; }
         var todo = plan.Squad.Where(x => !x.Cat.InAdventureBox).Select(x => x.Cat).ToList();
         if (todo.Count == 0) { Status(plan.Squad.Count > 0 ? "Squad already in the box." : "Nobody can go on a run."); return; }
 
-        LogContainers("before staging");
+        var job = new StageJob();
         foreach (var cat in todo)
-        {
-            if (!snap.Chars.TryGetValue(cat.Id, out var ch) || !ch.IsLiveAndValid) continue;
-            bool accepted = ch.MoveToRoomCenter(GameSnapshot.BoxContainer);
-            string? now = GameBreeding.RoomOf(ch)?.Name;
-            Log($"[Pedigree] box: {cat.Name} from {cat.Room ?? "outside"}: move returned {accepted}, room right after = {now ?? "(none)"}");
-            _pendingStage[cat.Id] = (cat.Name, cat.Room);
-        }
-        _stageCheckFrame = _houseFrame + 60;   // about a second at 60 fps
-        Status("Moving squad to the box...");
+            if (snap.Chars.TryGetValue(cat.Id, out var ch) && ch.IsLiveAndValid) job.Cats.Add((cat.Id, cat.Name, cat.Room));
+        if (job.Cats.Count == 0) return;
+        _boxSpot ??= LoadBoxSpot();
+        if (_boxSpot is { } known) job.Spots.Add(known);
+        foreach (var y in new[] { 1.9, 1.0, 0.4, 2.8 })
+            foreach (var x in new[] { 38.5, 37.5, 39.5, 36.5, 40.5, 35.5, 41.5 })
+                job.Spots.Add((x, y));
+        job.Spots.Add((23.0, 1.9));   // the SDK's spot, right of the starter house
+
+        foreach (var (id, _, from) in job.Cats)
+            if (from != null) _dayStart.TryAdd(id, from);
+        LogContainers("before staging");
+        var first = job.Cats[0];
+        Teleport(first.id, job.Spots[0]);
+        job.CheckAt = _houseFrame + 20;
+        _job = job;
+        Status(_boxSpot != null ? "Moving squad to the box..." : "Finding the adventure box...");
     });
 
-    /// <summary>Second half of staging, about a second later: keeps cats that reached the box, puts the rest back.</summary>
-    void CheckStaged() => Safe("check staging", () =>
+    /// <summary>One step of the squad move, on the game thread once the last move has had time to settle.</summary>
+    void StepStage(StageJob job) => Safe("stage squad", () =>
     {
-        var world = GameWorld.Current;
-        int placed = 0, failed = 0;
-        foreach (var (id, (name, from)) in _pendingStage)
+        try
         {
-            var ch = world.GetCatById(id);
-            if (!ch.HasValue || !ch.Value.IsLiveAndValid) { failed++; continue; }
-            string? now = GameBreeding.RoomOf(ch.Value)?.Name;
-            if (now == GameSnapshot.BoxContainer) { placed++; Log($"[Pedigree] box: {name} is in the box"); continue; }
-            failed++;
-            Log($"[Pedigree] box: {name} is in {now ?? "(none)"} a second later, not the box; moving it back to {from ?? "(none)"}");
-            if (from != null && now != from) ch.Value.MoveToRoomCenter(from);
+            if (!job.Found)
+            {
+                var (id, name, from) = job.Cats[0];
+                if (InBox(id))
+                {
+                    job.Found = true;
+                    job.Placed = 1;
+                    var spot = job.Spots[job.SpotIdx];
+                    Log($"[Pedigree] box: {name} landed in the box at ({spot.x:0.0}, {spot.y:0.0})");
+                    SaveBoxSpot(spot);
+                    double[] offsets = { 0.7, -0.7, 1.4, -1.4, 2.1 };
+                    for (int i = 1; i < job.Cats.Count; i++)
+                        Teleport(job.Cats[i].id, (spot.x + offsets[(i - 1) % offsets.Length], spot.y));
+                    job.CheckAt = _houseFrame + 30;
+                    if (job.Cats.Count == 1) Finish(job);
+                    return;
+                }
+                if (++job.SpotIdx < job.Spots.Count)
+                {
+                    Teleport(id, job.Spots[job.SpotIdx]);
+                    job.CheckAt = _houseFrame + 20;
+                    return;
+                }
+                Log($"[Pedigree] box: no tried spot reached the box; moving {name} back to {from ?? "(none)"}");
+                PutBack(id, from);
+                job.Failed.AddRange(job.Cats.Select(c => c.name));
+                Finish(job);
+                return;
+            }
+
+            var spotFound = job.Spots[job.SpotIdx];
+            var missing = job.Cats.Skip(1).Where(c => !InBox(c.id)).ToList();
+            if (missing.Count > 0 && !job.Retried)
+            {
+                job.Retried = true;   // offsets may have landed outside the box: try the exact spot once
+                foreach (var c in missing) Teleport(c.id, spotFound);
+                job.CheckAt = _houseFrame + 30;
+                return;
+            }
+            foreach (var c in job.Cats.Skip(1))
+            {
+                if (InBox(c.id)) { job.Placed++; Log($"[Pedigree] box: {c.name} is in the box"); continue; }
+                Log($"[Pedigree] box: {c.name} didn't reach the box; moving it back to {c.from ?? "(none)"}");
+                PutBack(c.id, c.from);
+                job.Failed.Add(c.name);
+            }
+            Finish(job);
         }
-        _pendingStage.Clear();
+        catch { _job = null; throw; }
+    });
+
+    void Finish(StageJob job)
+    {
+        _job = null;
         LogContainers("after staging");
         _refreshStatus = true;
-        Status($"Box: {placed} in." + (failed > 0 ? $" {failed} failed, left in rooms (see log)." : ""));
-    });
+        if (!job.Found)
+            Status("Couldn't find the box. Drag one cat into it by hand once, then press this again.");
+        else
+            Status($"Box: {job.Placed} in." + (job.Failed.Count > 0 ? $" {job.Failed.Count} failed, back in their rooms." : ""));
+    }
+
+    static void Teleport(long id, (double x, double y) spot)
+    {
+        var ch = GameWorld.Current.GetCatById(id);
+        if (ch is not { IsLiveAndValid: true } cat) return;
+        cat.Position = spot;   // GameChar is a handle: the setter teleports the cat by id
+    }
+
+    static bool InBox(long id)
+    {
+        var ch = GameWorld.Current.GetCatById(id);
+        return ch.HasValue && ch.Value.IsLiveAndValid && GameBreeding.RoomOf(ch.Value)?.Name == GameSnapshot.BoxContainer;
+    }
+
+    static void PutBack(long id, string? room)
+    {
+        var ch = GameWorld.Current.GetCatById(id);
+        if (room != null && ch.HasValue && ch.Value.IsLiveAndValid && GameBreeding.RoomOf(ch.Value)?.Name != room)
+            ch.Value.MoveToRoomCenter(room);
+    }
+
+    /// <summary>
+    /// Every few seconds: if a cat is sitting in the adventure box (put there by hand or by the game), remember where,
+    /// so the squad button knows a spot inside the box for this house.
+    /// </summary>
+    void LearnBoxSpot()
+    {
+        try
+        {
+            GameChar? boxed = null;
+            foreach (var c in Mew.Cats)
+                if (c.IsLiveAndValid && GameBreeding.RoomOf(c)?.Name == GameSnapshot.BoxContainer) { boxed = c; break; }
+            if (boxed is not { } cat) return;
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try
+                {
+                    var pos = cat.Position;
+                    if (_boxSpot is { } old && Math.Abs(old.x - pos.Item1) < 0.05 && Math.Abs(old.y - pos.Item2) < 0.05) return;
+                    Log($"[Pedigree] box: learned box spot ({pos.Item1:0.00}, {pos.Item2:0.00}) from {cat.Name}");
+                    SaveBoxSpot(pos);
+                }
+                catch (Exception ex) { Log($"[Pedigree] box: reading box spot failed: {ex.Message}"); }
+            });
+        }
+        catch (Exception ex) { Log($"[Pedigree] box: scan failed: {ex.Message}"); }
+    }
+
+    string BoxSpotFile => Path.Combine(GameAssets.ModFolder(Id), "box.txt");
+
+    (double x, double y)? LoadBoxSpot()
+    {
+        try
+        {
+            if (!File.Exists(BoxSpotFile)) return null;
+            var parts = File.ReadAllText(BoxSpotFile).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            return (double.Parse(parts[0], ci), double.Parse(parts[1], ci));
+        }
+        catch { return null; }
+    }
+
+    void SaveBoxSpot((double x, double y) spot)
+    {
+        _boxSpot = spot;
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(BoxSpotFile)!);
+            File.WriteAllText(BoxSpotFile, string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{spot.x:0.###} {spot.y:0.###}"));
+        }
+        catch (Exception ex) { Log($"[Pedigree] box: saving spot failed: {ex.Message}"); }
+    }
 
     void LogContainers(string when)
     {
@@ -272,7 +415,7 @@ public sealed class PedigreeMod : MewgenicsMod
         {
             if (Config == null) return;
             foreach (var key in new[] { "stage_squad", "stage_squad__hint", "stage_squad__action" }) Config.Remove(key);
-            foreach (var b in new[] { _show, _arrange, _stage, _undo })
+            foreach (var b in new[] { _show, _arrange, _stageButton, _undo })
             {
                 Config.SetHint(b.Key, b.Label);
                 Config.SetAction(b.Key, b.Label);
