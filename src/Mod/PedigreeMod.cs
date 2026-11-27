@@ -17,7 +17,7 @@ public sealed class PedigreeMod : MewgenicsMod
 {
     public override string Id => "pedigree";
     public override string Name => "Pedigree";
-    public override string Version => "0.1.10";
+    public override string Version => "0.1.11";
     public override string Description =>
         "Room plan, run squad, recruits and donations. Moves cats only when you press a button.";
     public override string Category => "Quality of Life";
@@ -46,6 +46,20 @@ public sealed class PedigreeMod : MewgenicsMod
     (double x, double y)? _boxSpot;
     int _houseFrame;
     volatile bool _planning;
+    /// <summary>Room moves waiting to be checked (arrange or undo).</summary>
+    volatile MoveCheck? _check;
+    RoomSpots? _roomSpots;
+    RoomSpots Spots => _roomSpots ??= new RoomSpots(Path.Combine(GameAssets.ModFolder(Id), "rooms.txt"), s => Log(s));
+    long _lastMoveTick;
+
+    sealed class MoveCheck
+    {
+        public string What = "";
+        public readonly List<(long id, string name, string to, int slot, string label)> Items = new();
+        public int CheckAt;
+        public bool Retried;
+        public string Note = "";
+    }
     int _gameThreadId;
 
     sealed class StageJob
@@ -106,7 +120,7 @@ public sealed class PedigreeMod : MewgenicsMod
 
     // ---------------------------------------------------------------- events
 
-    void OnDayAdvanced(DayAdvancedEvent e) { _morningDue = true; _refreshStatus = true; _dayStart.Clear(); _job = null; }
+    void OnDayAdvanced(DayAdvancedEvent e) { _morningDue = true; _refreshStatus = true; _dayStart.Clear(); _job = null; _check = null; }
     void OnAdventureReturn(AdventureReturnEvent e) { _refreshStatus = true; }
 
     void OnKeyDown(KeyEventArgs e)
@@ -126,6 +140,8 @@ public sealed class PedigreeMod : MewgenicsMod
         _gameThreadId = Environment.CurrentManagedThreadId;
         _houseFrame++;
         var job = _job;
+        var check = _check;
+        if (check != null && _houseFrame >= check.CheckAt) Timed("move check", () => StepCheck(check));
         if (job != null) { if (_houseFrame >= job.CheckAt) Timed("squad step", () => StepStage(job)); }
         else if (_houseFrame % 300 == 0) Timed("box scan", LearnBoxSpot);
         if (!_refreshStatus && !_morningDue) return;
@@ -176,6 +192,8 @@ public sealed class PedigreeMod : MewgenicsMod
             Plan plan;
             try { snap.DropGone(Log); }
             catch (Exception ex) { Log($"[Pedigree] checking for departed cats failed: {ex.Message}"); }
+            try { LearnRooms(snap); }
+            catch (Exception ex) { Log($"[Pedigree] learning room spots failed: {ex.Message}"); }
             try { plan = new Planner(snap.Cats, snap.Rooms, snap, settings).Build(snap.Day); }
             catch (Exception ex) { _planning = false; GameThread.Enqueue(() => Fail(what, ex)); return; }
             Log($"[Pedigree] timing {what}: read {readMs} ms on game thread, plan {planSw.ElapsedMilliseconds} ms on worker");
@@ -243,7 +261,7 @@ public sealed class PedigreeMod : MewgenicsMod
     void Arrange()
     {
         if (Mew.IsInCombat) { Status("Not during a fight."); return; }
-        if (_job != null) { Status("Still moving the squad..."); return; }
+        if (Busy()) return;
         Planned("arrange", ArrangeWith);
     }
 
@@ -252,21 +270,102 @@ public sealed class PedigreeMod : MewgenicsMod
         if (plan.Moves.Count == 0) { Status("Rooms already match the plan."); return; }
 
         string backup = BackupSave(snap.Day);
-        var failed = new List<string>();
-        var done = new List<string>();
+        var check = new MoveCheck { What = "arrange", Note = backup.Length > 0 ? " Save backed up." : "" };
+        var slots = new Dictionary<string, int>();
         foreach (var m in plan.Moves)
         {
-            bool ok = snap.Chars.TryGetValue(m.Cat.Id, out var ch) && ch.IsLiveAndValid && ch.MoveToRoomCenter(m.To);
-            if (ok)
-            {
-                // Remember only the first room of the day, so Undo goes back to the morning layout.
-                if (!_dayStart.ContainsKey(m.Cat.Id) && m.From != null && snap.Rooms.Any(r => r.Name == m.From)) _dayStart[m.Cat.Id] = m.From;
-                done.Add($"{m.Cat.Name} {m.From ?? "outside"}->{m.To}");
-            }
-            else failed.Add(m.Cat.Name);
+            if (!snap.Chars.TryGetValue(m.Cat.Id, out var ch) || !ch.IsLiveAndValid) continue;
+            // Remember only the first room of the day, so Undo goes back to the morning layout.
+            if (!_dayStart.ContainsKey(m.Cat.Id) && m.From != null && snap.Rooms.Any(r => r.Name == m.From)) _dayStart[m.Cat.Id] = m.From;
+            int slot = slots.GetValueOrDefault(m.To);
+            slots[m.To] = slot + 1;
+            PlaceInRoom(m.Cat.Id, m.To, slot);
+            check.Items.Add((m.Cat.Id, m.Cat.Name, m.To, slot, $"{m.Cat.Name} {m.From ?? "outside"}->{m.To}"));
         }
-        Status($"Moved {done.Count}." + (failed.Count > 0 ? $" {failed.Count} failed (see log)." : "") + (backup.Length > 0 ? " Save backed up." : ""));
-        Log($"[Pedigree] arranged: {(done.Count > 0 ? string.Join(", ", done) : "nothing")}" + (failed.Count > 0 ? $"; FAILED: {string.Join(", ", failed)}" : ""));
+        StartCheck(check);
+    }
+
+    bool Busy()
+    {
+        if (_job != null) { Status("Still moving the squad..."); return true; }
+        if (_check != null) { Status("Still moving cats..."); return true; }
+        return false;
+    }
+
+    /// <summary>
+    /// Puts a cat in a room by position, at the room's learned middle (spread out by <paramref name="slot"/>), or with
+    /// the SDK's room-center move for a room no cat has been seen in yet.
+    /// </summary>
+    void PlaceInRoom(long id, string room, int slot)
+    {
+        _lastMoveTick = Environment.TickCount64;
+        if (Spots.Spot(room, slot) is { } spot) { Teleport(id, spot); return; }
+        var ch = GameWorld.Current.GetCatById(id);
+        if (ch is { IsLiveAndValid: true } cat) cat.MoveToRoomCenter(room);
+    }
+
+    void StartCheck(MoveCheck check)
+    {
+        if (check.Items.Count == 0) { Status("Nothing moved."); return; }
+        check.CheckAt = _houseFrame + 30;   // half a second for the game to file the cats under their new rooms
+        _check = check;
+        Status("Moving cats...");
+    }
+
+    /// <summary>
+    /// Half a second after a batch of room moves: cats not in their room get one more try at the room's exact middle,
+    /// and anything still off after that is reported instead of counted as moved.
+    /// </summary>
+    void StepCheck(MoveCheck check) => Safe(check.What, () =>
+    {
+        try
+        {
+            var roomOf = RoomOfAll();
+            var off = check.Items.Where(i => roomOf.GetValueOrDefault(i.id) != i.to).ToList();
+            if (off.Count > 0 && !check.Retried)
+            {
+                check.Retried = true;
+                foreach (var i in off)
+                {
+                    Log($"[Pedigree] {check.What}: {i.name} ended up in {roomOf.GetValueOrDefault(i.id) ?? "(none)"}, not {i.to}; trying again");
+                    PlaceInRoom(i.id, i.to, 0);
+                }
+                check.CheckAt = _houseFrame + 30;
+                return;
+            }
+            _check = null;
+            var done = check.Items.Except(off).Select(i => i.label).ToList();
+            var failed = off.Select(i => $"{i.name} (in {roomOf.GetValueOrDefault(i.id) ?? "none"}, meant for {i.to})").ToList();
+            string verb = check.What == "undo" ? "Undid" : "Moved";
+            Status($"{verb} {done.Count}." + (failed.Count > 0 ? $" {failed.Count} didn't stay (see log)." : "") + check.Note);
+            Log($"[Pedigree] {check.What}: {(done.Count > 0 ? string.Join(", ", done) : "nothing")}" + (failed.Count > 0 ? $"; DIDN'T STAY: {string.Join(", ", failed)}" : ""));
+            _refreshStatus = true;
+        }
+        catch { _check = null; throw; }
+    });
+
+    static Dictionary<long, string> RoomOfAll()
+    {
+        var map = new Dictionary<long, string>();
+        foreach (var r in GameBreeding.GetRooms())
+            foreach (var id in r.CatIds) map.TryAdd(id, r.Name);
+        return map;
+    }
+
+    /// <summary>
+    /// Records where each breeding room's cats stand (worker thread). Skipped for a few seconds after the mod moves
+    /// cats, so a position the game hasn't caught up with can't be filed under the wrong room.
+    /// </summary>
+    void LearnRooms(GameSnapshot snap)
+    {
+        if (Environment.TickCount64 - _lastMoveTick < 3000 || _check != null || _job != null) return;
+        foreach (var room in snap.Rooms)
+        {
+            var pts = snap.Cats.Where(c => c.Room == room.Name && snap.Chars.ContainsKey(c.Id))
+                .Select(c => snap.Chars[c.Id].Position).ToList();
+            Spots.Observe(room.Name, pts);
+        }
+        Spots.SaveIfChanged();
     }
 
     /// <summary>
@@ -278,7 +377,7 @@ public sealed class PedigreeMod : MewgenicsMod
     void StageSquad()
     {
         if (Mew.IsInCombat) { Status("Not during a fight."); return; }
-        if (_job != null) { Status("Still moving the squad..."); return; }
+        if (Busy()) return;
         Planned("stage squad", StageWith);
     }
 
@@ -384,11 +483,11 @@ public sealed class PedigreeMod : MewgenicsMod
 
     static bool InBox(long id) => GameBreeding.GetRoom(GameSnapshot.BoxContainer)?.CatIds.Contains(id) == true;
 
-    static void PutBack(long id, string? room)
+    void PutBack(long id, string? room)
     {
         var ch = GameWorld.Current.GetCatById(id);
         if (room != null && ch.HasValue && ch.Value.IsLiveAndValid && GameBreeding.RoomOf(ch.Value)?.Name != room)
-            ch.Value.MoveToRoomCenter(room);
+            PlaceInRoom(id, room, 0);
     }
 
     /// <summary>
@@ -450,22 +549,27 @@ public sealed class PedigreeMod : MewgenicsMod
 
     void Undo() => Safe("undo", () =>
     {
+        if (Busy()) return;
         if (_dayStart.Count == 0) { Status("Nothing to undo today."); return; }
         var world = GameWorld.Current;
-        var back = new List<string>(); var failed = new List<string>();
+        var roomOf = RoomOfAll();
+        var check = new MoveCheck { What = "undo" };
+        var slots = new Dictionary<string, int>();
         foreach (var (id, room) in _dayStart)
         {
             var ch = world.GetCatById(id);
             if (!ch.HasValue || !ch.Value.IsLiveAndValid) continue;
-            string? now = GameBreeding.RoomOf(ch.Value)?.Name;
+            string? now = roomOf.GetValueOrDefault(id);
             if (now == room) continue;   // already where it started
             if (now == null) { Log($"[Pedigree] undo: skipped {ch.Value.Name}: not in the house any more"); continue; }   // donated, or away
-            if (ch.Value.MoveToRoomCenter(room)) back.Add($"{ch.Value.Name}->{room}"); else failed.Add(ch.Value.Name);
+            int slot = slots.GetValueOrDefault(room);
+            slots[room] = slot + 1;
+            PlaceInRoom(id, room, slot);
+            check.Items.Add((id, ch.Value.Name ?? "", room, slot, $"{ch.Value.Name}->{room}"));
         }
         _dayStart.Clear();
-        _refreshStatus = true;
-        Status($"Undid {back.Count} move{(back.Count == 1 ? "" : "s")}." + (failed.Count > 0 ? $" {failed.Count} failed (see log)." : ""));
-        Log($"[Pedigree] undo: {(back.Count > 0 ? string.Join(", ", back) : "nothing")}" + (failed.Count > 0 ? $"; FAILED: {string.Join(", ", failed)}" : ""));
+        if (check.Items.Count == 0) { Status("Everyone is already back."); return; }
+        StartCheck(check);
     });
 
     // ---------------------------------------------------------------- helpers
