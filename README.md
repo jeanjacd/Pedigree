@@ -10,8 +10,6 @@ Every in-game day the player makes the same coupled decisions:
 - **Inheritance.** Each stat is inherited from one parent: the better value with probability (100 + s) / (200 + s),
   where *s* is the room's stimulation. A good pair is two units whose strengths complement each other, placed in a
   high-stimulation room.
-- **Inbreeding.** Offspring of related units risk birth defects, rising steeply with kinship (75% for siblings), so
-  relatives, including parents and their offspring, must never share a room.
 - **Social constraints.** Rivals fight, aggressive units fight more in uncomfortable rooms, crowding past four units
   costs comfort, and bonded pairs pair far more reliably than strangers.
 - **Roster turnover.** Units retire after one expedition, so every squad sent out is breeding stock not kept, and every
